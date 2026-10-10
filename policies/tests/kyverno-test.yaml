@@ -87,3 +87,9 @@ results:
     resources:
       - pod-image-locale-hors-rpg-pipeline
     result: skip
+  - policy: verify-rpg-api-image
+    rule: registre-autorise
+    kind: Pod
+    resources:
+      - pod-init-image-locale
+    result: fail

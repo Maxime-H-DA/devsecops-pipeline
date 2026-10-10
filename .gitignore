@@ -24,3 +24,4 @@ crash.log
 terraform/*-config
 
 .vault-keys/
+.coverage

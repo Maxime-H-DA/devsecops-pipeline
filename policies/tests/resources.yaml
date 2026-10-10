@@ -130,3 +130,30 @@ spec:
         limits:
           cpu: 500m
           memory: 256Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pod-init-image-locale
+  namespace: rpg-pipeline
+spec:
+  initContainers:
+    - name: init
+      image: rpg-api:local
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+      resources:
+        limits:
+          cpu: 500m
+          memory: 256Mi
+  containers:
+    - name: app
+      image: hashicorp/vault:1.20.4
+      securityContext:
+        runAsNonRoot: true
+        allowPrivilegeEscalation: false
+      resources:
+        limits:
+          cpu: 500m
+          memory: 256Mi

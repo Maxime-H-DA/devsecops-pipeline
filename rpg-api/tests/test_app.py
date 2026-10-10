@@ -421,3 +421,103 @@ def test_true_client_ip_utilise_si_active(client, monkeypatch):
     reponse = client.post("/login", json={"username": "admin", "password": "mauvais"},
                           headers={"True-Client-IP": "203.0.113.2"})
     assert reponse.status_code == 401
+
+def test_header_authorization_sans_bearer(client):
+    reponse = client.post(
+        "/monstres",
+        json={"categorie": "NORMAL", "nom": "TestMonstre", "hp": "10", "atk": "5", "def": "3", "mercy": "50", "act1": "JOKE", "act2": "DANCE"},
+        headers={"Authorization": "Basic YWRtaW46cGFzc3dvcmQ="},
+    )
+    assert reponse.status_code == 401
+
+
+def test_token_signe_avec_une_autre_cle(client):
+    token_pirate = jwt.encode(  # nosemgrep: python.jwt.security.jwt-hardcode.jwt-python-hardcoded-secret
+        {"username": "admin", "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)},
+        "cle-de-l-attaquant-0123456789-abcdefghij",
+        algorithm="HS256",
+    )
+    reponse = client.post(
+        "/monstres",
+        json={"categorie": "NORMAL", "nom": "TestMonstre", "hp": "10", "atk": "5", "def": "3", "mercy": "50", "act1": "JOKE", "act2": "DANCE"},
+        headers={"Authorization": f"Bearer {token_pirate}"},
+    )
+    assert reponse.status_code == 401
+
+
+def test_token_alg_none_refuse(client):
+    token_sans_signature = jwt.encode(  # nosemgrep: python.jwt.security.jwt-none-alg.jwt-python-none-alg
+        {"username": "admin", "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)},
+        None,
+        algorithm="none",
+    )
+    reponse = client.post(
+        "/monstres",
+        json={"categorie": "NORMAL", "nom": "TestMonstre", "hp": "10", "atk": "5", "def": "3", "mercy": "50", "act1": "JOKE", "act2": "DANCE"},
+        headers={"Authorization": f"Bearer {token_sans_signature}"},
+    )
+    assert reponse.status_code == 401
+
+
+def test_login_json_liste(client):
+    assert client.post("/login", json=["admin", "password"]).status_code == 400
+
+
+def test_get_monstres_liste_les_monstres_ajoutes(client, token_valide):
+    client.post(
+        "/monstres",
+        json={"categorie": "NORMAL", "nom": "Visible", "hp": "10", "atk": "5", "def": "3", "mercy": "50", "act1": "JOKE", "act2": "DANCE"},
+        headers={"Authorization": f"Bearer {token_valide}"},
+    )
+    noms = [m["nom"] for m in client.get("/monstres").get_json()]
+    assert "Visible" in noms
+
+
+def test_miniboss_avec_mauvais_nombre_actions(client, token_valide):
+    reponse = client.post(
+        "/monstres",
+        json={"categorie": "MINIBOSS", "nom": "TestMonstre", "hp": "10", "atk": "5", "def": "3", "mercy": "50", "act1": "JOKE", "act2": "DANCE"},
+        headers={"Authorization": f"Bearer {token_valide}"},
+    )
+    assert reponse.status_code == 400
+
+
+def test_init_db_importe_le_csv(tmp_path, monkeypatch):
+    (tmp_path / "monsters.csv").write_text(
+        "NORMAL;Slime;20;5;3;30;JOKE;DANCE\n"
+        "\n"
+        "BOSS;Dragon;500;50;40;5;JOKE;DANCE;PET;DISCUSS\n"
+        "NORMAL;Fantome;10;2;1;50\n"
+        "ligne;incomplete\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "test.db"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(app_module, "DATABASE", str(db_path))
+    monkeypatch.setitem(flask_app.config, "DATABASE", str(db_path))
+
+    app_module.init_db()
+
+    conn = get_db()
+    monstres = {m["nom"]: dict(m) for m in conn.execute("SELECT * FROM monstres").fetchall()}
+    conn.close()
+    assert set(monstres) == {"Slime", "Dragon", "Fantome"}
+    assert monstres["Slime"]["act3"] == "-"
+    assert monstres["Dragon"]["act4"] == "DISCUSS"
+    assert monstres["Fantome"]["act1"] == "-"
+
+
+def test_init_db_ne_reimporte_pas_une_base_existante(tmp_path, monkeypatch):
+    (tmp_path / "monsters.csv").write_text("NORMAL;Slime;20;5;3;30;JOKE;DANCE\n", encoding="utf-8")
+    db_path = tmp_path / "test.db"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(app_module, "DATABASE", str(db_path))
+    monkeypatch.setitem(flask_app.config, "DATABASE", str(db_path))
+
+    app_module.init_db()
+    app_module.init_db()
+
+    conn = get_db()
+    nombre = conn.execute("SELECT COUNT(*) FROM monstres").fetchone()[0]
+    conn.close()
+    assert nombre == 1
