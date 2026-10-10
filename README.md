@@ -7,11 +7,12 @@ End-to-end DevSecOps platform, from commit to production: secure CI/CD pipeline,
 All of it is applied to a Flask API running in production at [rpg-pipeline.onrender.com](https://rpg-pipeline.onrender.com), which serves the monsters of a C++ RPG game. The goal wasn't the application itself, but to reproduce the practices of an enterprise DevOps team.
 
 **At a glance**
-- 10 CI jobs on every push and pull request, 8 of them blocking: merging is impossible if any of them fails
-- 45 unit tests, including attack tests
+- 12 CI jobs on every push and pull request, 10 of them required to merge; the image is published and signed only if all checks pass
+- The Docker image is built once, scanned (Trivy), attacked (OWASP ZAP), then that exact image is signed (Cosign)
+- Only images signed by the pipeline can run in the cluster, enforced by Kyverno
+- 58 unit tests (98% coverage), including attack tests, and 16 tests for the Kyverno policies
 - 189 Trivy alerts triaged, HTTP (ZAP) and Kubernetes (Checkov) misconfigurations fixed
-- 16 Terraform resources to rebuild the entire environment
-- 4 Kyverno policies in enforce mode
+- 17 Terraform resources to rebuild the entire environment
 - Secrets encrypted in Vault, never stored in plaintext in the cluster
 
 ## CI/CD Pipeline
@@ -19,26 +20,31 @@ All of it is applied to a Flask API running in production at [rpg-pipeline.onren
 ```
 push / pull request -> main
  |
- |-- in parallel, blocking:
+ |-- step 1, in parallel:
  |    |-- analyse-code: Gitleaks + Cppcheck (C++ code)
  |    |-- scan-jeu: Docker build (game) + Trivy
- |    |-- scan-api: Docker build (API) + Trivy
  |    |-- sast-api: Bandit + Semgrep
- |    |-- tests-api: pytest
+ |    |-- tests-api: pytest, minimum 95% coverage
  |    |-- iac-scan-checkov: Kubernetes manifests, Helm chart and Terraform
- |    |-- kyverno-policy-test: Kyverno policies replayed against the manifests
- |    `-- terraform-check: Terraform code formatting and validation
+ |    |-- kyverno-policy-test: policy unit tests + policies replayed against the manifests
+ |    |-- terraform-check: Terraform code formatting and validation
+ |    `-- build-api: Docker build of the API, done once
  |
- |-- in parallel, non-blocking:
- |    `-- dast-api: OWASP ZAP against the live API (Render)
+ |-- step 2, on the image built in step 1:
+ |    |-- scan-api: Trivy
+ |    `-- dast-api-local: smoke test + OWASP ZAP against the running container
  |
- `-- after the 8 blocking jobs, on main only:
-      `-- supply-chain-api: image publishing, SBOM (Syft) + signing (Cosign)
+ `-- step 3, on main only, if everything passed:
+      `-- supply-chain-api: publishing, SBOM (Syft), signing (Cosign)
+
+On main, dast-api also scans the live API (Render) with OWASP ZAP, as monitoring.
 ```
 
-Scans run before the merge, not after, and only an image that has passed every check is published and signed. Pre-commit hooks rerun most of these checks locally before the push even happens, results show up in the **Security > Code scanning** tab, and Dependabot keeps dependencies up to date by going through the same checks.
+Scans run before the merge, not after. Pre-commit hooks rerun most of these checks locally before the push even happens, results show up in the **Security > Code scanning** tab, and Dependabot keeps dependencies up to date by going through the same checks.
 
 ## Deployment
+
+All three methods need a `.env` file at the root of the repo with `API_SECRET_KEY`, `ADMIN_USERNAME` and `ADMIN_PASSWORD`. Commands are for PowerShell (Windows).
 
 ### Docker
 
@@ -79,7 +85,7 @@ The API is available at **http://localhost:5000**
 
 ### Terraform and Vault
 
-Full version: Terraform rebuilds the cluster, Kyverno, Vault, the application and the monitoring stack. Secrets are encrypted in Vault and injected at pod startup by a sidecar; each pod authenticates with its own ServiceAccount, with read-only, time-limited access.
+Full version: Terraform rebuilds the cluster, Kyverno, Vault, the application and the monitoring stack. The cluster runs the image signed by the pipeline, pulled from GitHub Container Registry; Kyverno verifies its signature and pins its digest. Secrets are encrypted in Vault and injected at pod startup by a sidecar; each pod authenticates with its own ServiceAccount, with read-only, time-limited access.
 
 <details>
 <summary>Commands</summary>
@@ -91,39 +97,17 @@ terraform apply "-target=kind_cluster.rpg"
 terraform apply
 cd ..
 
-docker build -t rpg-api:local -f rpg-api/Dockerfile .
-kind load docker-image rpg-api:local --name rpg-pipeline
-
-$init = kubectl exec -n vault vault-0 -- vault operator init -key-shares=5 -key-threshold=3 -format=json | ConvertFrom-Json
-$keys = $init.unseal_keys_b64
-$token = $init.root_token
-
-kubectl exec -n vault vault-0 -- vault operator unseal $keys[0]
-kubectl exec -n vault vault-0 -- vault operator unseal $keys[1]
-kubectl exec -n vault vault-0 -- vault operator unseal $keys[2]
-kubectl exec -n vault vault-0 -- vault login -no-print $token
-
-kubectl exec -n vault vault-0 -- vault auth enable kubernetes
-kubectl exec -n vault vault-0 -- vault write auth/kubernetes/config kubernetes_host="https://kubernetes.default.svc:443"
-kubectl exec -n vault vault-0 -- vault secrets enable -path=secret kv-v2
-
-Get-Content vault/policies/rpg-api-policy.hcl -Raw | kubectl exec -i -n vault vault-0 -- vault policy write rpg-api -
-kubectl exec -n vault vault-0 -- vault write auth/kubernetes/role/rpg-api bound_service_account_names=rpg-api bound_service_account_namespaces=rpg-pipeline policies=rpg-api ttl=1h
-
-kubectl exec -n vault vault-0 -- mkdir -p /vault/audit
-kubectl exec -n vault vault-0 -- chmod u+x /vault/audit
-kubectl exec -n vault vault-0 -- vault audit enable file file_path=/vault/audit/audit.log
-
-.\vault\seed-secrets.ps1
-kubectl exec -n vault vault-0 -- vault token revoke -self
-
-kubectl rollout restart deployment/rpg-api -n rpg-pipeline
-kubectl rollout status deployment/rpg-api -n rpg-pipeline --timeout=180s
-
-# Unseal keys: keep them outside the repo, required to unseal Vault again
-$keys
+.\vault\init-vault.ps1
 
 kubectl port-forward -n rpg-pipeline svc/rpg-api 5000:80
+```
+
+`init-vault.ps1` initializes and configures Vault, loads the secrets from `.env`, then revokes the root token. The unseal keys are encrypted with Windows DPAPI and stored in `.vault-keys/`, ignored by Git.
+
+After a Docker or PC restart, Vault starts sealed:
+
+```
+.\vault\unseal-vault.ps1
 ```
 
 </details>
@@ -160,7 +144,7 @@ The script fetches the monsters from the live API and updates `monsters.csv` bef
 
 - **CI/CD & infrastructure**: GitHub Actions, Docker, Kubernetes (Kind), Helm, Terraform, Alpine Linux, Dependabot
 - **Security**: Gitleaks, Trivy, Bandit, Semgrep, OWASP ZAP, Cppcheck, Checkov, Kyverno, Syft, Cosign, HashiCorp Vault
-- **Backend & testing**: Flask, SQLite, JWT, pytest
+- **Backend & testing**: Flask, Gunicorn, SQLite, JWT, pytest
 - **Observability**: Prometheus, Grafana
 
 ## Source Project
